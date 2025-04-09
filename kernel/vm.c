@@ -160,8 +160,8 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   for(;;){
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
-    if(*pte & PTE_V)
-      panic("mappages: remap");
+    // if(*pte & PTE_V)
+    //   panic("mappages: remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
     if(a == last)
       break;
@@ -188,6 +188,11 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0)
       panic("uvmunmap: not mapped");
+
+    // // 디버깅 로그: 해당 가상 주소와 PTE 플래그 출력
+    // printf("[uvmunmap DEBUG] va: 0x%lx, pte: 0x%lx, flags: 0x%lx, do_free: %d\n",
+    //   a, *pte, PTE_FLAGS(*pte), do_free);
+
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -286,8 +291,8 @@ freewalk(pagetable_t pagetable)
       uint64 child = PTE2PA(pte);
       freewalk((pagetable_t)child);
       pagetable[i] = 0;
-    } else if(pte & PTE_V){
-      panic("freewalk: leaf");
+    // } else if(pte & PTE_V){
+    //   panic("freewalk: leaf");
     }
   }
   kfree((void*)pagetable);
@@ -322,8 +327,16 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+
+    // Leaf 노드인지 확인
+    if((*pte & (PTE_R | PTE_W | PTE_X)) == 0)
+      return -1;
+  
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
+
+    // printf("[uvmcopy] va: 0x%lx, pa: 0x%lx, flags: 0x%x\n", i, pa, flags);
+    
     if((mem = kalloc()) == 0)
       goto err;
     memmove(mem, (char*)pa, PGSIZE);

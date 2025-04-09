@@ -6,6 +6,10 @@
 #include "proc.h"
 #include "defs.h"
 
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -25,6 +29,8 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+struct mmap_area ma[64] = { 0, };
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -311,6 +317,71 @@ fork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+
+  // find corresponding mmap_area
+  for (int j = 0; j < 64; j++) {
+    if (ma[j].p == p) {
+      // find empty mmap_area
+      for (int k = 0; k < 64; k++) {
+        if (ma[k].addr == 0) {
+          if (ma[j].f != 0) {
+            ma[k].f = ma[j].f;
+            filedup(ma[j].f); // increment f ref count
+            ma[k].f->off = ma[j].offset;  
+          }
+          ma[k].addr = ma[j].addr;
+          ma[k].flags = ma[j].flags & ~MAP_POPULATE;
+          ma[k].length = ma[j].length;
+          ma[k].p = np;
+          ma[k].prot = ma[j].prot;
+          ma[k].offset = ma[j].offset;
+
+          pte_t *pte;
+          uint64 flags;
+          uint64 ptr = 0;
+          void *new_physical_page;
+
+          for(ptr = ma[k].addr; ptr < ma[k].addr + ma[k].length; ptr += PGSIZE) {
+            if((pte = walk(p->pagetable, ptr, 0)) == 0) {
+              panic("fork: pte doesn't exist\n");
+              return -1;
+            }
+              
+            // if(!((uint64)pte & PTE_V)) {
+            //   panic("fork: pte is NOT PRESENTED\n");
+            //   return -1;
+            // }
+
+            flags = PTE_FLAGS((uint64)pte);
+
+            // in uvmcopy(), copying flags of PTE doesn't work well,
+            // so copied flags of PTE is only PTE_V. so uvmunmap() serve it NOT LEAF.
+            // below code is making right PTE flags.
+            if (ma[k].prot & PROT_READ) {
+              flags |= PTE_R;
+            }
+            if (ma[k].prot & PROT_WRITE) {
+              flags |= PTE_W;
+            }
+
+            if((new_physical_page = kalloc()) == 0) {
+              panic("fork: kalloc failed");
+              return -1;
+            }
+
+            memset(new_physical_page, 0, PGSIZE);
+
+            if(mappages(np->pagetable, ptr, PGSIZE, (uint64)new_physical_page, flags) == -1) {
+              panic("fork: mappages failed");
+              return -1;
+            }
+          }
+
+          break;
+        }
+      }
+    }
+  }
 
   release(&np->lock);
 
@@ -692,4 +763,312 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+uint64
+mmap(uint64 addr, int length, int prot, int flags, int fd, int offset) {
+  struct proc *p = myproc();
+  struct file *f = 0;
+
+  if (fd != -1)
+    f = p->ofile[fd];
+
+  int read = 0;
+  int write = 0;
+
+  if (prot & PROT_READ)
+    read = 1;
+  if (prot & PROT_WRITE)
+    write = 1;
+  
+  int anonymous = 0;
+  int populate = 0;
+
+  if (flags & MAP_ANONYMOUS)
+    anonymous = 1;
+  if (flags & MAP_POPULATE)
+    populate = 1;
+  
+  if (anonymous == 0 && fd == -1) {
+    panic("mmap: It's not anonymous, but when the fd is -1\n");
+    return 0;
+  }
+
+  if (f != 0 && (read != f->readable || write != f->writable)) {
+    panic("mmap: The protection of the file and the prot of the parameter are different\n");
+    return 0;
+  }
+  
+  int i = 0;
+  for (i = 0; (ma[i].addr != 0) && i < 64; i++);
+  if (i == 64) {
+    panic("mmap: There are no empty space in mmap_area\n");
+    return 0;
+  }
+
+  uint64 start_addr = MMAPBASE + addr;
+  if (start_addr >= MAXVA) {
+    panic("mmap: too high addr");
+    return 0;
+  }
+
+  ma[i].f = 0;
+  if (f != 0) {
+    // increment file reference count
+    filedup(f);
+
+    ma[i].f = f;
+  }
+
+  ma[i].addr = start_addr;
+  ma[i].flags = flags;
+  ma[i].length = length;
+  ma[i].prot = prot;
+  ma[i].p = p;
+  ma[i].offset = offset;
+
+  // make permission
+  int perm = 0;
+  if (read == 1)
+    perm = perm | PTE_R;
+  if (write == 1)
+    perm = perm | PTE_W;
+
+  // just record its mapping area
+  if (populate == 0) {
+    return start_addr;
+  }
+
+  else if (populate == 1) {
+    // file mapping
+    if (anonymous == 0) { 
+      f->off = offset;
+      uint64 ptr = 0; 
+      void *new_physical_page = 0;
+
+      for (ptr = start_addr; ptr < start_addr + length; ptr += PGSIZE) {
+        new_physical_page = kalloc();
+        // printf("[mmap] kalloc returned: %p\n", new_physical_page);
+        // printf("[mmap] free_pages after kalloc: %d\n", freemem());
+        if (new_physical_page == 0) {
+          panic("mmap: Failed to allocate physical page in file mapping\n");
+          return 0;
+        }
+        
+        // initialize page with 0
+        memset(new_physical_page, 0, PGSIZE);
+        
+        // 직접 readi를 호출하여 커널 메모리에 데이터를 복사
+        ilock(f->ip);
+        int r = readi(f->ip, 0, (uint64)new_physical_page, f->off, PGSIZE);
+        if(r > 0)
+          f->off += r;
+        iunlock(f->ip);
+
+        // printf("text[0] in kernel: %d\n", ((char*)new_physical_page)[0]);
+
+        if (mappages(p->pagetable, ptr, PGSIZE, (uint64)new_physical_page, perm | PTE_U) == -1) {
+          panic("mmap: Failed to mappages in file mapping\n");
+          return 0;
+        }     
+      }
+
+      return start_addr;
+    }
+
+
+    // anonymous mapping
+    else if (anonymous == 1) { 
+      uint64 ptr = 0; 
+      void *new_physical_page = 0;
+
+      for (ptr = start_addr; ptr < start_addr + length; ptr += PGSIZE) {
+        new_physical_page = kalloc();
+
+        // printf("[mmap] kalloc returned: %p\n", new_physical_page);
+        
+        if (new_physical_page == 0) {
+          panic("mmap: Failed to allocate physical page in anonymous mapping\n");
+          return 0;
+        }
+        
+        // allocatae page fiiled with 0
+        memset(new_physical_page, 0, PGSIZE);
+
+        if (mappages(p->pagetable, ptr, PGSIZE, (uint64)new_physical_page, perm | PTE_U) == -1) {
+          panic("mmap: Failed to mappages in anonymous mapping\n");
+          return 0;
+        } 
+      }
+
+      return start_addr;
+    }
+    
+  }
+
+  // if populate is not 0/1, return fail.
+  return 0;
+}
+
+
+int
+pfh(uint64 addr, uint64 err) {
+  struct proc *p = myproc();
+
+  int ma_idx = -1;
+
+  for (int i = 0; i < 64; i++) {
+    if ((ma[i].addr <= addr) && (addr <= (ma[i].addr + ma[i].length)) && (ma[i].p == p)) {
+        ma_idx = i;
+        break;
+    }
+  }
+
+  // if (ma[ma_idx].flags & MAP_POPULATE) {
+  //   printf("pfh: MAP_POPULATE is already set\n");
+  //   return -1;
+  // }
+
+  if (ma_idx == -1) {
+    panic("Page Fault: Corresponding mmap_area is not found\n");
+    return -1;
+  }
+
+  // read prot check
+  if ((err&0xff) == 13 && (ma[ma_idx].prot & PROT_READ) != PROT_READ) {
+    panic("Page Fault: READ - prot in mmap_area are not same\n");
+    return -1;
+  }
+
+  // write prot check
+  if ((err&0xff) == 15 && (ma[ma_idx].prot & PROT_WRITE) != PROT_WRITE) {
+    panic("Page Fault: WRITE - prot in mmap_area are not same\n");
+    return -1;
+  }
+
+  // printf("read: %d, write: %d\n", read, write);
+  // printf("ma_idx: %d, prot_read: %d, prot_write:%d\n", ma_idx, ma[ma_idx].prot & PROT_READ, ma[ma_idx].prot & PROT_WRITE);
+
+  int anonymous = 0;
+  if (ma[ma_idx].flags & MAP_ANONYMOUS)
+    anonymous = 1;
+
+  // make permission
+  int perm = 0;
+  if ((ma[ma_idx].prot & PROT_READ) == PROT_READ)
+    perm = perm | PTE_R;
+  if ((ma[ma_idx].prot & PROT_WRITE) == PROT_WRITE)
+    perm = perm | PTE_W;
+
+  // file mapping
+  if (anonymous == 0) { 
+    struct file *f = ma[ma_idx].f;
+    f->off = ma[ma_idx].offset;
+
+    uint64 ptr = 0; 
+    void *new_physical_page = 0;
+
+    for (ptr = ma[ma_idx].addr; ptr < ma[ma_idx].addr + ma[ma_idx].length; ptr += PGSIZE) {
+      new_physical_page = kalloc();
+      // printf("[pfh] kalloc returned: %p\n", new_physical_page);
+      if (new_physical_page == 0) {
+        panic("mmap: Failed to allocate physical page in file mapping\n");
+        return -1;
+      }
+      
+      // initialize page with 0
+      memset(new_physical_page, 0, PGSIZE);
+      
+      // 직접 readi를 호출하여 커널 메모리에 데이터를 복사
+      ilock(f->ip);
+      int r = readi(f->ip, 0, (uint64)new_physical_page, f->off, PGSIZE);
+      if(r > 0)
+        f->off += r;
+      iunlock(f->ip);
+
+      if (mappages(p->pagetable, ptr, PGSIZE, (uint64)new_physical_page, perm | PTE_U) == -1) {
+        panic("mmap: Failed to mappages in file mapping\n");
+        return -1;
+      }     
+    }
+
+    ma[ma_idx].flags |= MAP_POPULATE;
+
+    return 0;
+  }
+
+
+  // anonymous mapping
+  else if (anonymous == 1) { 
+    uint64 ptr = 0; 
+    void *new_physical_page = 0;
+
+    for (ptr = ma[ma_idx].addr; ptr < ma[ma_idx].addr + ma[ma_idx].length; ptr += PGSIZE) {
+      new_physical_page = kalloc();
+      // printf("[pfh] kalloc returned: %p\n", new_physical_page);
+      if (new_physical_page == 0) {
+        panic("mmap: Failed to allocate physical page in anonymous mapping\n");
+        return 0;
+      }
+      
+      // allocatae page fiiled with 0
+      memset(new_physical_page, 0, PGSIZE);
+
+      if (mappages(p->pagetable, ptr, PGSIZE, (uint64)new_physical_page, perm | PTE_U) == -1) {
+        panic("mmap: Failed to mappages in anonymous mapping\n");
+        return -1;
+      } 
+    }
+
+    ma[ma_idx].flags |= MAP_POPULATE;
+
+    return 0;
+  }
+
+  panic("Page Fault: unexpected error\n");
+  return -1;
+}
+
+int
+munmap(uint64 addr) {
+  struct proc *p = myproc();
+  int ma_idx = -1;
+ 
+  for (int i = 0; i < 64; i++) {
+    if (ma[i].addr == addr && ma[i].p == p) {
+      ma_idx = i;
+      break;
+    }
+  }
+  
+  if (ma_idx == -1) {
+    panic("munmap: Corresponding mmap_area is not found\n");
+    return -1;
+  }
+  
+  if (ma[ma_idx].flags & MAP_POPULATE) {
+    // length가 PGSIZE의 배수라고 가정
+    int npages = ma[ma_idx].length / PGSIZE;
+    // uvmunmap()을 이용하여 해당 영역의 매핑을 해제하면서 물리 페이지도 free하도록 한다.
+    uvmunmap(p->pagetable, ma[ma_idx].addr, npages, 1);
+  
+    // mmap 영역의 정보를 초기화한다.
+    ma[ma_idx].f = 0;
+    ma[ma_idx].addr = 0;
+    ma[ma_idx].length = 0;
+    ma[ma_idx].offset = 0;
+    ma[ma_idx].prot = 0;
+    ma[ma_idx].flags = 0;
+    ma[ma_idx].p = 0;
+  } else {
+    set_free_pages();
+  }
+ 
+  return 1;
+}
+
+
+int
+freemem() {
+  return get_free_pages();
 }

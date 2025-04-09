@@ -36,6 +36,11 @@ trapinithart(void)
 void
 usertrap(void)
 {
+  uint64 scause = r_scause() & 0xff;
+  uint64 fault_va = r_stval(); // fault 발생한 가상 주소
+  // if (scause != 8)
+  //   printf("interrupt occurred at address: 0x%lx, scause: 0x%lx\n", fault_va, scause);
+
   int which_dev = 0;
 
   if((r_sstatus() & SSTATUS_SPP) != 0)
@@ -65,7 +70,13 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } else if(scause == 13 || scause == 15) { 
+    // write / read page fault
+    // printf("Page Fault occurred at address: 0x%lx, scause: 0x%lx\n", fault_va, scause);
+    pfh(fault_va, scause);
+  }
+  
+  else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);

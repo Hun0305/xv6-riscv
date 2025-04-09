@@ -9,6 +9,13 @@
 #include "riscv.h"
 #include "defs.h"
 
+// as we use struct file, we should include this headers.
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+
+int free_pages;
+
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -26,8 +33,12 @@ struct {
 void
 kinit()
 {
+  // initalize free_pages
+  free_pages = 0;
+
   initlock(&kmem.lock, "kmem");
   freerange(end, (void*)PHYSTOP);
+  printf("free_pages: %d\n", free_pages);
 }
 
 void
@@ -51,8 +62,15 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
+
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
+
+  // set free_pages
+  free_pages++;
+
+  // if (free_pages >= 32000)
+  //   printf("free_pages: %d\n", free_pages);
 
   r = (struct run*)pa;
 
@@ -74,9 +92,25 @@ kalloc(void)
   r = kmem.freelist;
   if(r)
     kmem.freelist = r->next;
+
+  // use free_pages
+  free_pages--;
+
+  // if (free_pages >= 32000)
+  //   printf("free_pages: %d\n", free_pages);
+
   release(&kmem.lock);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+
+// Returns # of free_pages
+int get_free_pages(void) {
+  return free_pages;
+}
+
+void set_free_pages(void) {
+  free_pages++;
 }
